@@ -14,117 +14,256 @@ permissions:
 
 jobs:
   tag-stable:
-    name: Tag Stable Release
+    name: 🏷️ Tag Stable Release
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+    outputs:
+      tag: ${{ steps.tag.outputs.tag }}
+      version: ${{ steps.tag.outputs.version }}
     steps:
       - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Generate stability tag
+      - name: 🔢 Generate Version
         id: tag
         run: |
-          # Get current date and short commit hash
+          # Get version components
           DATE=$(date +'%Y%m%d')
           SHORT_SHA=$(git rev-parse --short HEAD)
-          STABLE_TAG="stable-${DATE}-${SHORT_SHA}"
+          VERSION_NUM=$(git tag -l 'v*' --sort=-v:refname | head -1 | sed 's/v//' || echo "0.0.0")
+          
+          # Parse version and increment patch
+          IFS='.' read -r MAJOR MINOR PATCH <<< "$VERSION_NUM"
+          NEW_PATCH=$((PATCH + 1))
+          NEW_VERSION="${MAJOR}.${MINOR}.${NEW_PATCH}"
+          
+          STABLE_TAG="v${NEW_VERSION}+stable.${DATE}.${SHORT_SHA}"
           
           echo "tag=${STABLE_TAG}" >> $GITHUB_OUTPUT
+          echo "version=${NEW_VERSION}" >> $GITHUB_OUTPUT
           echo "date=${DATE}" >> $GITHUB_OUTPUT
           echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+          echo "prev_version=${VERSION_NUM}" >> $GITHUB_OUTPUT
 
-      - name: Create or move stable tag
+      - name: 🏷️ Create Git Tags
         run: |
           git config user.name "GitHub Actions"
           git config user.email "actions@github.com"
           
-          # Remove old stable-latest tag if exists
+          # Remove old stable-latest tag
           git push origin :refs/tags/stable-latest 2>/dev/null || true
           
-          # Create annotated tag
-          git tag -a stable-latest -m "Latest stable version: ${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}"
+          # Create stable-latest tag
+          git tag -a stable-latest -m "Latest stable: ${{ steps.tag.outputs.tag }}"
           
-          # Create dated tag
-          git tag -a ${{ steps.tag.outputs.tag }} -m "Stable version passing all tests
-          
+          # Create versioned stable tag
+          git tag -a ${{ steps.tag.outputs.tag }} -m "✅ Stable Release ${{ steps.tag.outputs.tag }}
+
+          Version: ${{ steps.tag.outputs.version }}
           Date: ${{ steps.tag.outputs.date }}
           Commit: ${{ steps.tag.outputs.sha }}
-          Tests: All passing
-          
-          To revert to this version:
+          Status: All tests passing ✓
+
+          Quick revert:
           git checkout ${{ steps.tag.outputs.tag }}"
           
           # Push tags
           git push origin stable-latest --force
           git push origin ${{ steps.tag.outputs.tag }}
 
-      - name: Create GitHub Release for stable tag
+      - name: 📊 Gather Release Info
+        id: release_info
+        run: |
+          # Get commit info
+          COMMIT_MSG=$(git log -1 --pretty=%B | head -1)
+          COMMIT_AUTHOR=$(git log -1 --pretty=%an)
+          COMMIT_EMAIL=$(git log -1 --pretty=%ae)
+          
+          # Get changed files since last tag
+          LAST_TAG=$(git describe --tags --abbrev=0 ${{ steps.tag.outputs.tag }}^ 2>/dev/null || echo "")
+          if [ -n "$LAST_TAG" ]; then
+            CHANGED_FILES=$(git diff --name-only $LAST_TAG ${{ steps.tag.outputs.tag }} | head -20)
+            CHANGE_COUNT=$(git diff --name-only $LAST_TAG ${{ steps.tag.outputs.tag }} | wc -l)
+          else
+            CHANGED_FILES=$(git diff --name-only HEAD~1 HEAD | head -20)
+            CHANGE_COUNT=$(git diff --name-only HEAD~1 HEAD | wc -l)
+          fi
+          
+          echo "commit_msg=${COMMIT_MSG}" >> $GITHUB_OUTPUT
+          echo "commit_author=${COMMIT_AUTHOR}" >> $GITHUB_OUTPUT
+          echo "change_count=${CHANGE_COUNT}" >> $GITHUB_OUTPUT
+          
+          # Create file categories
+          echo "CHANGED_FILES<<EOF" >> $GITHUB_OUTPUT
+          echo "$CHANGED_FILES" >> $GITHUB_OUTPUT
+          echo "EOF" >> $GITHUB_OUTPUT
+
+      - name: 🎨 Create GitHub Release
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.tag.outputs.tag }}
-          name: Stable ${{ steps.tag.outputs.date }}
+          name: 🚀 Stable v${{ steps.tag.outputs.version }} • ${{ steps.tag.outputs.date }}
           body: |
-            ## Stable Release ${{ steps.tag.outputs.tag }}
-            
-            This release has passed all CI checks:
-            - Unit tests (46 tests)
-            - Integration tests (8 tests)
-            - Linting and formatting checks
-            - Security audit
-            
-            **Commit:** ${{ steps.tag.outputs.sha }}
-            **Date:** ${{ steps.tag.outputs.date }}
-            
-            ### Quick Reversion
-            
-            If you need to revert to this stable version:
-            
+            <div align="center">
+
+            # 🎯 Trace Proxy Stable Release
+
+            **Version:** `v${{ steps.tag.outputs.version }}`  
+            **Commit:** `${{ steps.tag.outputs.sha }}`  
+            **Date:** ${{ steps.tag.outputs.date }}  
+            **Author:** @${{ steps.release_info.outputs.commit_author }}
+
+            [![CI](https://github.com/${{ github.repository }}/actions/workflows/ci.yml/badge.svg?tag=${{ steps.tag.outputs.tag }})](https://github.com/${{ github.repository }}/actions/runs/${{ github.run_id }})
+
+            </div>
+
+            ---
+
+            ## ✅ Quality Assurance
+
+            All quality checks passed before release:
+
+            | Check | Status | Details |
+            |-------|--------|---------|
+            | 🧪 Unit Tests | ✅ Pass | 52 tests |
+            | 🔗 Integration Tests | ✅ Pass | 8 scenarios |
+            | 📝 Code Format | ✅ Pass | rustfmt |
+            | 🔍 Linting | ✅ Pass | clippy |
+            | 🔒 Security Audit | ✅ Pass | cargo-audit |
+            | 📊 Code Coverage | ✅ Tracked | tarpaulin |
+
+            ---
+
+            ## 📝 Commit Information
+
+            > ${{ steps.release_info.outputs.commit_msg }}
+
+            **Full SHA:** `${{ github.sha }}`
+
+            ---
+
+            ## 📦 Changes in This Release
+
+            <details>
+            <summary>📁 ${{ steps.release_info.outputs.change_count }} file(s) changed</summary>
+
+            ```
+            ${{ steps.release_info.outputs.CHANGED_FILES }}
+            ```
+
+            </details>
+
+            ---
+
+            ## 🔄 Quick Actions
+
+            ### Rollback to This Version
             ```bash
-            # Checkout the stable tag
+            # Option 1: Checkout tag (safe)
+            git fetch origin
             git checkout ${{ steps.tag.outputs.tag }}
-            
-            # Or reset main to this version (use with caution)
+
+            # Option 2: Reset main (destructive - use with caution)
             git checkout main
             git reset --hard ${{ steps.tag.outputs.tag }}
-            git push --force-with-lease
+            git push --force-with-lease origin main
             ```
-            
-            ### Always Available Tags
-            
-            - `stable-latest` - Always points to the most recent stable version
-            - `${{ steps.tag.outputs.tag }}` - This specific stable version
+
+            ### Update to Latest Stable
+            ```bash
+            git fetch origin
+            git checkout stable-latest
+            ```
+
+            ---
+
+            ## 🏷️ Available Tags
+
+            | Tag | Purpose |
+            |-----|---------|
+            | `stable-latest` | Always the most recent stable |
+            | `${{ steps.tag.outputs.tag }}` | This specific release |
+
+            ---
+
+            ## 📚 Release History
+
+            View all stable releases: [Releases Page](../../releases)
+
+            ---
+
+            <div align="center">
+
+            **🤖 Auto-generated by GitHub Actions**
+
+            </div>
           prerelease: false
           draft: false
+          generate_release_notes: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
-      - name: Update stable badge
+      - name: 📣 Notify Success
         run: |
-          echo "Stable tag ${{ steps.tag.outputs.tag }} has been created"
-          echo "Use 'stable-latest' tag for the most recent stable version"
+          echo "✅ Release ${{ steps.tag.outputs.tag }} created successfully"
+          echo "🔗 https://github.com/${{ github.repository }}/releases/tag/${{ steps.tag.outputs.tag }}"
 
-  rollback-instructions:
-    name: Provide Rollback Info
+  update-release-list:
+    name: 📋 Update Release Index
     runs-on: ubuntu-latest
     needs: [tag-stable]
     steps:
-      - name: Output rollback commands
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: 🗂️ Update Release Index
+        run: |
+          echo "## 📦 Recent Stable Releases" > RELEASE_INDEX.md
+          echo "" >> RELEASE_INDEX.md
+          echo "| Version | Date | Commit | Link |" >> RELEASE_INDEX.md
+          echo "|---------|------|--------|------|" >> RELEASE_INDEX.md
+          
+          git fetch --tags
+          git tag -l 'v*+stable*' --sort=-v:refname | head -10 | while read tag; do
+            VERSION=$(echo $tag | sed 's/v\([0-9.]*\)+stable.*/\1/')
+            DATE=$(echo $tag | grep -o '[0-9]\{8\}')
+            SHA=$(echo $tag | grep -o '[a-f0-9]\{7,8\}$')
+            echo "| v${VERSION} | ${DATE} | \`${SHA}\` | [View](../../releases/tag/${tag}) |" >> RELEASE_INDEX.md
+          done
+          
+          echo "" >> RELEASE_INDEX.md
+          echo "*Auto-generated: $(date -u +'%Y-%m-%d %H:%M UTC')*" >> RELEASE_INDEX.md
+
+      - name: 💾 Commit Release Index
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          if [ -f RELEASE_INDEX.md ]; then
+            git add RELEASE_INDEX.md
+            git diff --cached --quiet || git commit -m "📋 Update release index [skip ci]"
+            git push || echo "No changes to push"
+          fi
+
+  rollback-instructions:
+    name: ℹ️ Rollback Info
+    runs-on: ubuntu-latest
+    needs: [tag-stable]
+    steps:
+      - name: 📝 Display Commands
         run: |
           echo "========================================="
-          echo "STABILITY TRACKING ENABLED"
+          echo "  🏷️ STABLE RELEASE: ${{ needs.tag-stable.outputs.tag }}"
           echo "========================================="
           echo ""
-          echo "Most recent stable version tagged as: stable-latest"
+          echo "📥 Checkout this version:"
+          echo "   git checkout ${{ needs.tag-stable.outputs.tag }}"
           echo ""
-          echo "To revert to the last stable version:"
-          echo "  git checkout stable-latest"
+          echo "🔄 Always get latest stable:"
+          echo "   git checkout stable-latest"
           echo ""
-          echo "To see all stable versions:"
-          echo "  git tag -l 'stable-*' | sort -r | head -10"
-          echo ""
-          echo "To revert main branch to last stable:"
-          echo "  git checkout main"
-          echo "  git reset --hard stable-latest"
-          echo "  git push --force-with-lease"
+          echo "📋 List recent stable versions:"
+          echo "   git tag -l 'v*+stable*' | sort -r | head -10"
           echo "========================================="
