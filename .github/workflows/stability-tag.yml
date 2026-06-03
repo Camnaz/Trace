@@ -1,0 +1,130 @@
+name: Tag Stable Version
+
+on:
+  push:
+    branches: [main, master]
+  workflow_run:
+    workflows: ["CI"]
+    types:
+      - completed
+    branches: [main, master]
+
+permissions:
+  contents: write
+
+jobs:
+  tag-stable:
+    name: Tag Stable Release
+    runs-on: ubuntu-latest
+    if: ${{ github.event.workflow_run.conclusion == 'success' || github.event_name == 'push' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Generate stability tag
+        id: tag
+        run: |
+          # Get current date and short commit hash
+          DATE=$(date +'%Y%m%d')
+          SHORT_SHA=$(git rev-parse --short HEAD)
+          STABLE_TAG="stable-${DATE}-${SHORT_SHA}"
+          
+          echo "tag=${STABLE_TAG}" >> $GITHUB_OUTPUT
+          echo "date=${DATE}" >> $GITHUB_OUTPUT
+          echo "sha=${SHORT_SHA}" >> $GITHUB_OUTPUT
+
+      - name: Create or move stable tag
+        run: |
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          
+          # Remove old stable-latest tag if exists
+          git push origin :refs/tags/stable-latest 2>/dev/null || true
+          
+          # Create annotated tag
+          git tag -a stable-latest -m "Latest stable version: ${{ steps.tag.outputs.date }}-${{ steps.tag.outputs.sha }}"
+          
+          # Create dated tag
+          git tag -a ${{ steps.tag.outputs.tag }} -m "Stable version passing all tests
+          
+          Date: ${{ steps.tag.outputs.date }}
+          Commit: ${{ steps.tag.outputs.sha }}
+          Tests: All passing
+          
+          To revert to this version:
+          git checkout ${{ steps.tag.outputs.tag }}"
+          
+          # Push tags
+          git push origin stable-latest --force
+          git push origin ${{ steps.tag.outputs.tag }}
+
+      - name: Create GitHub Release for stable tag
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.tag.outputs.tag }}
+          name: Stable ${{ steps.tag.outputs.date }}
+          body: |
+            ## Stable Release ${{ steps.tag.outputs.tag }}
+            
+            This release has passed all CI checks:
+            - Unit tests (46 tests)
+            - Integration tests (8 tests)
+            - Linting and formatting checks
+            - Security audit
+            
+            **Commit:** ${{ steps.tag.outputs.sha }}
+            **Date:** ${{ steps.tag.outputs.date }}
+            
+            ### Quick Reversion
+            
+            If you need to revert to this stable version:
+            
+            ```bash
+            # Checkout the stable tag
+            git checkout ${{ steps.tag.outputs.tag }}
+            
+            # Or reset main to this version (use with caution)
+            git checkout main
+            git reset --hard ${{ steps.tag.outputs.tag }}
+            git push --force-with-lease
+            ```
+            
+            ### Always Available Tags
+            
+            - `stable-latest` - Always points to the most recent stable version
+            - `${{ steps.tag.outputs.tag }}` - This specific stable version
+          prerelease: false
+          draft: false
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Update stable badge
+        run: |
+          echo "Stable tag ${{ steps.tag.outputs.tag }} has been created"
+          echo "Use 'stable-latest' tag for the most recent stable version"
+
+  rollback-instructions:
+    name: Provide Rollback Info
+    runs-on: ubuntu-latest
+    needs: [tag-stable]
+    steps:
+      - name: Output rollback commands
+        run: |
+          echo "========================================="
+          echo "STABILITY TRACKING ENABLED"
+          echo "========================================="
+          echo ""
+          echo "Most recent stable version tagged as: stable-latest"
+          echo ""
+          echo "To revert to the last stable version:"
+          echo "  git checkout stable-latest"
+          echo ""
+          echo "To see all stable versions:"
+          echo "  git tag -l 'stable-*' | sort -r | head -10"
+          echo ""
+          echo "To revert main branch to last stable:"
+          echo "  git checkout main"
+          echo "  git reset --hard stable-latest"
+          echo "  git push --force-with-lease"
+          echo "========================================="

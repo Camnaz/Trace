@@ -1,0 +1,122 @@
+name: Rollback to Stable
+
+on:
+  workflow_dispatch:
+    inputs:
+      target:
+        description: 'Version to rollback to'
+        required: true
+        default: 'stable-latest'
+        type: string
+      branch:
+        description: 'Branch to rollback'
+        required: true
+        default: 'main'
+        type: string
+      confirm:
+        description: 'Confirm rollback (type YES to proceed)'
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  rollback:
+    name: Execute Rollback
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm == 'YES' }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: ${{ github.event.inputs.branch }}
+
+      - name: Verify target exists
+        run: |
+          git fetch --tags
+          if git rev-parse "${{ github.event.inputs.target }}" >/dev/null 2>&1; then
+            echo "Target ${{ github.event.inputs.target }} exists"
+            git log -1 --oneline ${{ github.event.inputs.target }}
+          else
+            echo "ERROR: Target ${{ github.event.inputs.target }} not found"
+            echo "Available stable tags:"
+            git tag -l 'stable-*' | sort -r | head -20
+            exit 1
+          fi
+
+      - name: Create backup tag
+        run: |
+          BACKUP_TAG="backup-before-rollback-$(date +%Y%m%d-%H%M%S)"
+          git config user.name "GitHub Actions"
+          git config user.email "actions@github.com"
+          git tag -a "${BACKUP_TAG}" -m "Automatic backup before rollback to ${{ github.event.inputs.target }}"
+          git push origin "${BACKUP_TAG}"
+          echo "Backup tag created: ${BACKUP_TAG}"
+
+      - name: Perform rollback
+        run: |
+          git reset --hard ${{ github.event.inputs.target }}
+          git push --force-with-lease origin ${{ github.event.inputs.branch }}
+
+      - name: Create rollback notification
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const body = `## ⚠️ Rollback Executed
+            
+            The branch **${{ github.event.inputs.branch }}** has been rolled back.
+            
+            | Detail | Value |
+            |--------|-------|
+            | Rolled back to | \`${{ github.event.inputs.target }}\` |
+            | Branch | \`${{ github.event.inputs.branch }}\` |
+            | Executed by | @${{ github.actor }} |
+            | Time | ${new Date().toISOString()} |
+            
+            ### Recovery
+            
+            If this rollback was incorrect, you can restore the previous state using the backup tag that was created.
+            
+            Check recent backup tags with:
+            \`\`\`bash
+            git fetch --tags
+            git tag -l 'backup-before-rollback-*' | sort -r | head -5
+            \`\`\`
+            `;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `Rollback: ${{ github.event.inputs.branch }} → ${{ github.event.inputs.target }}`,
+              body: body,
+              labels: ['rollback', 'stability']
+            });
+
+      - name: Output success message
+        run: |
+          echo "========================================="
+          echo "ROLLBACK COMPLETED SUCCESSFULLY"
+          echo "========================================="
+          echo "Branch: ${{ github.event.inputs.branch }}"
+          echo "Target: ${{ github.event.inputs.target }}"
+          echo "========================================="
+
+  abort-rollback:
+    name: Abort - Confirmation Required
+    runs-on: ubuntu-latest
+    if: ${{ github.event.inputs.confirm != 'YES' }}
+    steps:
+      - name: Abort message
+        run: |
+          echo "========================================="
+          echo "ROLLBACK ABORTED"
+          echo "========================================="
+          echo ""
+          echo "To execute a rollback, you must:"
+          echo "1. Go to Actions → Rollback to Stable"
+          echo "2. Set 'confirm' to exactly: YES"
+          echo ""
+          echo "This is a safety measure to prevent accidental rollbacks."
+          echo "========================================="
+          exit 1

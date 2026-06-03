@@ -1,0 +1,168 @@
+name: Periodic Stability Tests
+
+on:
+  schedule:
+    # Run every 6 hours
+    - cron: '0 */6 * * *'
+  workflow_dispatch: # Allow manual trigger
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  full-test-suite:
+    name: Full Test Suite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+        rust-version: [1.75.0, stable, nightly]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust ${{ matrix.rust-version }}
+        uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: ${{ matrix.rust-version }}
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ matrix.rust-version }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Clean build
+        run: cargo clean
+
+      - name: Build (debug)
+        run: cargo build --verbose
+
+      - name: Build (release)
+        run: cargo build --release --verbose
+
+      - name: Run all tests
+        run: cargo test --verbose --all-features 2>&1 | tee test-output.txt
+
+      - name: Run integration tests with stress
+        run: |
+          for i in {1..3}; do
+            echo "=== Integration test run $i ==="
+            cargo test --test integration_tests --verbose
+          done
+
+      - name: Upload test results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-results-${{ matrix.os }}-${{ matrix.rust-version }}
+          path: test-output.txt
+          retention-days: 30
+
+  performance-tests:
+    name: Performance Benchmarks
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Cargo dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/bin/
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+
+      - name: Build release
+        run: cargo build --release
+
+      - name: Run criterion benchmarks if available
+        run: cargo bench 2>/dev/null || echo "No benchmarks configured"
+
+      - name: Measure test execution time
+        run: |
+          echo "=== Measuring test execution time ==="
+          /usr/bin/time -v cargo test --release --test integration_tests 2>&1 | tee timing-results.txt
+
+      - name: Upload timing results
+        uses: actions/upload-artifact@v4
+        with:
+          name: timing-results
+          path: timing-results.txt
+          retention-days: 90
+
+  stability-check:
+    name: Stability Check
+    runs-on: ubuntu-latest
+    needs: [full-test-suite]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust stable
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Run tests 10 times for flakiness detection
+        run: |
+          mkdir -p stability-reports
+          for i in {1..10}; do
+            echo "=== Stability test run $i ===" | tee -a stability-reports/stability-log.txt
+            if cargo test --quiet 2>&1 | tee -a stability-reports/stability-log.txt; then
+              echo "PASS" >> stability-reports/results.txt
+            else
+              echo "FAIL" >> stability-reports/results.txt
+            fi
+          done
+          echo "=== Summary ===" | tee -a stability-reports/stability-log.txt
+          echo "Total runs: 10" | tee -a stability-reports/stability-log.txt
+          echo "Passed: $(grep -c PASS stability-reports/results.txt || echo 0)" | tee -a stability-reports/stability-log.txt
+          echo "Failed: $(grep -c FAIL stability-reports/results.txt || echo 0)" | tee -a stability-reports/stability-log.txt
+
+      - name: Upload stability report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: stability-report
+          path: stability-reports/
+          retention-days: 90
+
+  notify-on-failure:
+    name: Notify on Failure
+    runs-on: ubuntu-latest
+    needs: [full-test-suite, performance-tests, stability-check]
+    if: failure()
+    steps:
+      - name: Create issue on failure
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const title = `🚨 Periodic Tests Failed - ${new Date().toISOString()}`;
+            const body = `## Stability Test Failure
+            
+            The periodic stability tests have failed.
+            
+            - **Workflow Run:** ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+            - **Commit:** ${{ github.sha }}
+            - **Branch:** ${{ github.ref }}
+            
+            Please investigate and determine if this is a regression or an intermittent failure.
+            
+            /cc @${{ github.repository_owner }}`;
+            
+            github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: title,
+              body: body,
+              labels: ['bug', 'ci-failure', 'stability']
+            });
