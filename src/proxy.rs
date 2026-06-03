@@ -25,7 +25,155 @@ use crate::types::{
 /// Header name for customer identification.
 const HEADER_CUSTOMER_ID: &str = "x-customer-id";
 /// Header name for request tracing.
+#[allow(dead_code)]
 const HEADER_REQUEST_ID: &str = "x-request-id";
+
+/// Zero-allocation, platform-agnostic payload extraction contract.
+///
+/// Trace ingests raw request bodies destined for *any* model provider. Rather
+/// than branching on provider throughout the hot path, every supported wire
+/// shape implements `ModelPayloadAgnostic`, giving the evaluator a single,
+/// borrowed view. Implementations return [`Cow`] so the common case (Trace
+/// native, or a single-string field) borrows directly with **no allocation**;
+/// only shapes that require stitching multiple fields (e.g. multi-message
+/// chat transcripts) fall back to an owned string.
+pub trait ModelPayloadAgnostic {
+    /// The primary user content to be evaluated.
+    fn extract_prompt(&self) -> std::borrow::Cow<'_, str>;
+    /// Optional system / developer instruction, if present.
+    fn extract_system(&self) -> Option<std::borrow::Cow<'_, str>>;
+    /// Target model identifier.
+    fn extract_model(&self) -> std::borrow::Cow<'_, str>;
+}
+
+/// Native Trace payload — already normalized, so every field borrows.
+impl<'p> ModelPayloadAgnostic for IncomingPayload<'p> {
+    #[inline]
+    fn extract_prompt(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.prompt.as_ref())
+    }
+    #[inline]
+    fn extract_system(&self) -> Option<std::borrow::Cow<'_, str>> {
+        self.system.as_ref().map(|s| std::borrow::Cow::Borrowed(s.as_ref()))
+    }
+    #[inline]
+    fn extract_model(&self) -> std::borrow::Cow<'_, str> {
+        std::borrow::Cow::Borrowed(self.target_model.as_ref())
+    }
+}
+
+/// The wire shape detected for an inbound payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PayloadShape {
+    /// Trace-native `{ prompt, system, target_model }`.
+    Native,
+    /// OpenAI Chat Completions `{ model, messages: [{role, content}] }`.
+    OpenAiChat,
+    /// Anthropic Messages `{ model, system, messages: [{role, content}] }`.
+    AnthropicMessages,
+}
+
+/// A borrowed, normalized view over a parsed JSON body that adapts the three
+/// supported provider shapes to the [`ModelPayloadAgnostic`] contract without
+/// copying the underlying buffer. The only allocation occurs when a chat
+/// transcript must be concatenated into a single evaluable prompt.
+pub struct AgnosticView<'v> {
+    value: &'v serde_json::Value,
+    shape: PayloadShape,
+}
+
+impl<'v> AgnosticView<'v> {
+    /// Detect the provider shape of an already-parsed JSON body.
+    pub fn detect(value: &'v serde_json::Value) -> Self {
+        let shape = if value.get("prompt").is_some() && value.get("target_model").is_some() {
+            PayloadShape::Native
+        } else if value.get("messages").is_some() {
+            // Anthropic carries a top-level `system`; OpenAI puts it in messages.
+            if value.get("system").is_some() {
+                PayloadShape::AnthropicMessages
+            } else {
+                PayloadShape::OpenAiChat
+            }
+        } else {
+            PayloadShape::Native
+        };
+        Self { value, shape }
+    }
+
+    /// The detected wire shape.
+    #[inline]
+    pub fn shape(&self) -> PayloadShape {
+        self.shape
+    }
+
+    /// Concatenate the user-role message contents from a chat transcript.
+    fn join_user_messages(&self) -> String {
+        let mut out = String::new();
+        if let Some(arr) = self.value.get("messages").and_then(|m| m.as_array()) {
+            for msg in arr {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("");
+                if role == "user" {
+                    if let Some(content) = msg.get("content").and_then(|c| c.as_str()) {
+                        if !out.is_empty() {
+                            out.push('\n');
+                        }
+                        out.push_str(content);
+                    }
+                }
+            }
+        }
+        out
+    }
+}
+
+impl<'v> ModelPayloadAgnostic for AgnosticView<'v> {
+    fn extract_prompt(&self) -> std::borrow::Cow<'_, str> {
+        match self.shape {
+            PayloadShape::Native => self
+                .value
+                .get("prompt")
+                .and_then(|p| p.as_str())
+                .map(std::borrow::Cow::Borrowed)
+                .unwrap_or(std::borrow::Cow::Borrowed("")),
+            // Chat shapes require stitching → owned, but only here.
+            PayloadShape::OpenAiChat | PayloadShape::AnthropicMessages => {
+                std::borrow::Cow::Owned(self.join_user_messages())
+            }
+        }
+    }
+
+    fn extract_system(&self) -> Option<std::borrow::Cow<'_, str>> {
+        match self.shape {
+            PayloadShape::Native | PayloadShape::AnthropicMessages => self
+                .value
+                .get("system")
+                .and_then(|s| s.as_str())
+                .map(std::borrow::Cow::Borrowed),
+            PayloadShape::OpenAiChat => {
+                // OpenAI carries the system instruction as a `system`-role message.
+                self.value
+                    .get("messages")
+                    .and_then(|m| m.as_array())
+                    .and_then(|arr| {
+                        arr.iter().find(|msg| {
+                            msg.get("role").and_then(|r| r.as_str()) == Some("system")
+                        })
+                    })
+                    .and_then(|msg| msg.get("content").and_then(|c| c.as_str()))
+                    .map(std::borrow::Cow::Borrowed)
+            }
+        }
+    }
+
+    fn extract_model(&self) -> std::borrow::Cow<'_, str> {
+        let key = if self.shape == PayloadShape::Native { "target_model" } else { "model" };
+        self.value
+            .get(key)
+            .and_then(|m| m.as_str())
+            .map(std::borrow::Cow::Borrowed)
+            .unwrap_or(std::borrow::Cow::Borrowed("unknown"))
+    }
+}
 
 /// Main handler for proxy requests.
 #[instrument(skip(state, body))]
@@ -74,7 +222,7 @@ pub async fn handle_proxy_request(
     
     let parse_latency = start.elapsed().as_micros() as u64;
     info!(latency_us = parse_latency, "Payload parsed");
-    
+
     // Step 4: Evaluate against customer policies
     let evaluation_result = match evaluate_payload(&state, customer_id, &payload).await {
         Ok(result) => result,
@@ -91,7 +239,7 @@ pub async fn handle_proxy_request(
     let response = match evaluation_result.verdict {
         TraceVerdict::Pass => {
             info!("Verdict: PASS - Forwarding to upstream");
-            forward_to_upstream(&state, &headers, body_bytes).await
+            forward_to_upstream(&state, &headers, body_bytes.clone()).await
         }
         TraceVerdict::Block => {
             info!("Verdict: BLOCK - Returning block response");
@@ -115,7 +263,7 @@ pub async fn handle_proxy_request(
                 }
                 None => {
                     warn!("Modify verdict but no modified payload present");
-                    forward_to_upstream(&state, &headers, body_bytes).await
+                    forward_to_upstream(&state, &headers, body_bytes.clone()).await
                 }
             }
         }
@@ -128,6 +276,11 @@ pub async fn handle_proxy_request(
         evaluation_latency_us = evaluation_result.latency_us,
         "Request complete"
     );
+
+    // Record metrics (lock-free atomics — never blocks)
+    state.metrics.record_request(&evaluation_result.verdict);
+    state.metrics.eval_latency_us.observe(evaluation_result.latency_us);
+    state.metrics.total_latency_us.observe(total_latency);
 
     // Emit telemetry asynchronously — lagging subscribers are dropped, never block.
     let event = TelemetryEvent {
@@ -142,6 +295,15 @@ pub async fn handle_proxy_request(
     };
     // send() only errors when there are zero subscribers — that's fine.
     let _ = state.telemetry_tx.send(event);
+
+    // Capture the request into the per-org training corpus. Retained until the
+    // next verified Git sync, this data feeds future engine upgrades.
+    // Allocation is deferred to after the upstream response path.
+    state.shell.corpus().capture(
+        customer_id,
+        payload.prompt.into_owned(),
+        evaluation_result.verdict,
+    );
 
     response
 }
@@ -193,7 +355,7 @@ async fn evaluate_payload(
 ) -> Result<EvaluationResult, TraceError> {
     // Get customer policy
     let policy = state.policy_store.get_policy(customer_id).await
-        .ok_or_else(|| TraceError::PolicyNotFound(customer_id))?;
+        .ok_or(TraceError::PolicyNotFound(customer_id))?;
     
     // Initialize the trajectory engine
     let engine = TrajectoryEngine::new(policy);
@@ -201,7 +363,7 @@ async fn evaluate_payload(
     // Perform evaluation with timeout
     let eval_start = Instant::now();
     
-    let result = engine.evaluate(payload).await;
+    let result = engine.evaluate(payload);
     
     let eval_latency = eval_start.elapsed().as_micros() as u64;
     
@@ -271,6 +433,7 @@ async fn forward_to_upstream(
                 }
                 Err(e) => {
                     error!("Failed to read upstream response body: {}", e);
+                    state.metrics.upstream_errors.inc();
                     error_response(
                         StatusCode::BAD_GATEWAY,
                         "Failed to read upstream response"
@@ -280,6 +443,7 @@ async fn forward_to_upstream(
         }
         Err(e) => {
             error!("Failed to forward to upstream: {}", e);
+            state.metrics.upstream_errors.inc();
             error_response(
                 StatusCode::BAD_GATEWAY,
                 &format!("Upstream unavailable: {}", e)
@@ -355,6 +519,63 @@ mod tests {
     use axum::body::Body;
     use axum::http::{HeaderMap, HeaderValue};
     use bytes::Bytes;
+
+    #[test]
+    fn test_agnostic_detects_native_shape() {
+        let v = serde_json::json!({ "prompt": "hello", "target_model": "gpt-4o" });
+        let view = AgnosticView::detect(&v);
+        assert_eq!(view.shape(), PayloadShape::Native);
+        assert_eq!(view.extract_prompt(), "hello");
+        assert_eq!(view.extract_model(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_agnostic_detects_openai_chat() {
+        let v = serde_json::json!({
+            "model": "gpt-4o",
+            "messages": [
+                { "role": "system", "content": "be concise" },
+                { "role": "user", "content": "first" },
+                { "role": "user", "content": "second" }
+            ]
+        });
+        let view = AgnosticView::detect(&v);
+        assert_eq!(view.shape(), PayloadShape::OpenAiChat);
+        // user messages are stitched
+        assert_eq!(view.extract_prompt(), "first\nsecond");
+        // system role message is surfaced
+        assert_eq!(view.extract_system().as_deref(), Some("be concise"));
+        assert_eq!(view.extract_model(), "gpt-4o");
+    }
+
+    #[test]
+    fn test_agnostic_detects_anthropic_messages() {
+        let v = serde_json::json!({
+            "model": "claude-3-opus",
+            "system": "you are a financial advisor",
+            "messages": [ { "role": "user", "content": "what is an ETF?" } ]
+        });
+        let view = AgnosticView::detect(&v);
+        assert_eq!(view.shape(), PayloadShape::AnthropicMessages);
+        assert_eq!(view.extract_prompt(), "what is an ETF?");
+        assert_eq!(view.extract_system().as_deref(), Some("you are a financial advisor"));
+        assert_eq!(view.extract_model(), "claude-3-opus");
+    }
+
+    #[test]
+    fn test_native_payload_borrows_without_alloc() {
+        use std::borrow::Cow;
+        let payload = IncomingPayload {
+            prompt: Cow::Borrowed("borrowed prompt"),
+            system: Some(Cow::Borrowed("sys")),
+            context: std::collections::HashMap::new(),
+            target_model: Cow::Borrowed("m"),
+            parameters: None,
+        };
+        // Native extraction must stay borrowed (zero-allocation contract).
+        assert!(matches!(payload.extract_prompt(), Cow::Borrowed(_)));
+        assert!(matches!(payload.extract_model(), Cow::Borrowed(_)));
+    }
 
     #[test]
     fn test_extract_customer_id_valid() {

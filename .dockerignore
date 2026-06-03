@@ -1,0 +1,35 @@
+# Rust build artifacts
+target/
+Cargo.lock.bak
+
+# IDE / Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS files
+.DS_Store
+Thumbs.db
+
+# Git
+.git/
+.gitignore
+
+# CI / Dev tooling
+.github/
+.devin/
+
+# Documentation (not needed at runtime)
+docs/
+marketing/
+website/
+
+# Tests (compiled in, but source not needed separately)
+tests/
+
+# Local config overrides
+trace.toml
+trace.yaml
+trace.json

@@ -11,15 +11,21 @@ use tracing::{debug, info};
 use crate::types::{CustomerId, CustomerPolicy};
 
 /// A thread-safe, lock-free store for customer policies.
+///
+/// The inner map is shared behind an `Arc` so that cloning the store (which
+/// Axum does for every request via the `State` extractor) yields a handle to
+/// the *same* underlying data rather than a deep copy. This makes writes
+/// durable across requests and keeps the clone allocation-free.
+#[derive(Clone)]
 pub struct PolicyStore {
-    inner: DashMap<CustomerId, ArcSwap<CustomerPolicy>>,
+    inner: Arc<DashMap<CustomerId, ArcSwap<CustomerPolicy>>>,
 }
 
 impl PolicyStore {
     /// Create a new, empty PolicyStore.
     pub fn new() -> Self {
         Self {
-            inner: DashMap::new(),
+            inner: Arc::new(DashMap::new()),
         }
     }
     
@@ -83,18 +89,6 @@ impl PolicyStore {
 impl Default for PolicyStore {
     fn default() -> Self {
         Self::new()
-    }
-}
-
-impl Clone for PolicyStore {
-    fn clone(&self) -> Self {
-        // Create a new store and copy all policies
-        let new_store = Self::new();
-        for entry in self.inner.iter() {
-            let policy = entry.value().load_full();
-            new_store.inner.insert(*entry.key(), ArcSwap::new(policy));
-        }
-        new_store
     }
 }
 

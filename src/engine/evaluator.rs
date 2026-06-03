@@ -9,12 +9,13 @@
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
+use crate::engine::entropy::{scan as entropy_scan, EntropyVerdict};
 use crate::types::{
     ConstraintAction, ConstraintType, CustomerPolicy, EvaluationResult,
     IncomingPayload, PolicyConstraint, TraceVerdict,
 };
 #[cfg(test)]
-use crate::types::{CustomerId, TargetField};
+use crate::types::TargetField;
 
 /// The Trajectory Engine evaluates payloads against customer policies.
 pub struct TrajectoryEngine {
@@ -31,7 +32,6 @@ struct CompiledPattern {
 }
 
 enum PatternMatcher {
-    Regex(regex::Regex),
     Keyword(aho_corasick::AhoCorasick),
     Length { max_chars: usize },
 }
@@ -61,24 +61,24 @@ impl TrajectoryEngine {
                     if keyword_patterns.is_empty() {
                         continue;
                     }
-                    
-                    // Build regex from patterns
-                    let pattern_str = keyword_patterns
-                        .iter()
-                        .map(|p| regex::escape(p))
-                        .collect::<Vec<_>>()
-                        .join("|");
-                    
-                    let regex_str = if *case_sensitive {
-                        format!("({})", pattern_str)
+
+                    // Compile keyword patterns into a Deterministic Finite Automaton
+                    // using the Aho-Corasick algorithm for strict O(n) scan time.
+                    let patterns_refs: Vec<&str> = keyword_patterns.iter().map(|s| s.as_str()).collect();
+                    let ac = if *case_sensitive {
+                        aho_corasick::AhoCorasick::builder()
+                            .match_kind(aho_corasick::MatchKind::Standard)
+                            .build(&patterns_refs)
                     } else {
-                        format!("(?i)({})", pattern_str)
+                        aho_corasick::AhoCorasick::builder()
+                            .match_kind(aho_corasick::MatchKind::Standard)
+                            .ascii_case_insensitive(true)
+                            .build(&patterns_refs)
                     };
-                    
-                    match regex::Regex::new(&regex_str) {
-                        Ok(re) => PatternMatcher::Regex(re),
+                    match ac {
+                        Ok(ac) => PatternMatcher::Keyword(ac),
                         Err(e) => {
-                            warn!("Invalid regex for constraint {}: {}", constraint.id, e);
+                            warn!("Invalid Aho-Corasick pattern for constraint {}: {}", constraint.id, e);
                             continue;
                         }
                     }
@@ -111,48 +111,76 @@ impl TrajectoryEngine {
     /// Evaluate an incoming payload against all constraints.
     /// 
     /// Returns an EvaluationResult with the verdict and any modifications.
-    pub async fn evaluate(&self, payload: &IncomingPayload<'_>) -> EvaluationResult {
-        let mut triggered_constraints = Vec::new();
+    /// Evaluate an incoming payload against all constraints.
+    ///
+    /// This is a **synchronous, CPU-bound** operation with no I/O and no
+    /// `.await` points.  Declaring it `async` would force every caller to
+    /// box a future, adding heap pressure on the sub-15 ms hot path.
+    pub fn evaluate(&self, payload: &IncomingPayload<'_>) -> EvaluationResult {
+        // ── Circuit-breaker: rolling Shannon entropy scan ──
+        // O(n) over the prompt bytes; flips instantly on anomalous clustering.
+        let prompt_bytes = payload.prompt.as_bytes();
+        match entropy_scan(prompt_bytes) {
+            EntropyVerdict::LowEntropy => {
+                return EvaluationResult {
+                    verdict: TraceVerdict::Block,
+                    triggered_constraints: vec![],
+                    explanation: Some(
+                        "Blocked by entropy circuit breaker: anomalously low entropy (possible structured PII / credential leak)".into(),
+                    ),
+                    modified_payload: None,
+                    latency_us: 0,
+                };
+            }
+            EntropyVerdict::HighEntropy => {
+                return EvaluationResult {
+                    verdict: TraceVerdict::Block,
+                    triggered_constraints: vec![],
+                    explanation: Some(
+                        "Blocked by entropy circuit breaker: anomalously high entropy (possible encoded injection / obfuscation)".into(),
+                    ),
+                    modified_payload: None,
+                    latency_us: 0,
+                };
+            }
+            EntropyVerdict::Safe => {}
+        }
+
+        // Pre-allocate for the common case: most policies have < 8 constraints.
+        let mut triggered_constraints = Vec::with_capacity(8);
         let mut final_verdict = TraceVerdict::Pass;
-        let mut explanation = None;
-        
+        let mut block_explanation: Option<&'static str> = None;
+        let mut block_constraint_id: Option<uuid::Uuid> = None;
+
         // Check compiled patterns (fast path)
         for pattern in &self.compiled_patterns {
             let matched = match &pattern.matcher {
-                PatternMatcher::Regex(re) => {
-                    re.is_match(&payload.prompt)
-                }
                 PatternMatcher::Keyword(ac) => {
-                    ac.find(payload.prompt.as_ref()).is_some()
+                    ac.find(prompt_bytes).is_some()
                 }
                 PatternMatcher::Length { max_chars } => {
                     payload.prompt.len() > *max_chars
                 }
             };
-            
+
             if matched {
                 trace!(
                     constraint_id = %pattern.constraint_id,
                     "Constraint matched"
                 );
-                
+
                 triggered_constraints.push(pattern.constraint_id);
-                
+
                 // Apply action
                 match pattern.action {
                     ConstraintAction::Block => {
                         final_verdict = TraceVerdict::Block;
-                        explanation = Some(format!(
-                            "Blocked by constraint: {}", 
-                            pattern.constraint_id
-                        ));
+                        block_explanation = Some("Blocked by constraint");
+                        block_constraint_id = Some(pattern.constraint_id);
                         break; // Stop evaluation on block
                     }
                     ConstraintAction::Log => {
                         // Just log, continue evaluation
-                        if final_verdict == TraceVerdict::Pass {
-                            final_verdict = TraceVerdict::Pass;
-                        }
                     }
                     ConstraintAction::Modify => {
                         final_verdict = TraceVerdict::Modify;
@@ -161,34 +189,32 @@ impl TrajectoryEngine {
                 }
             }
         }
-        
+
         // Check vector similarity constraints (if no block yet)
         if final_verdict != TraceVerdict::Block {
             for constraint in &self.policy.constraints {
                 if !constraint.enabled {
                     continue;
                 }
-                
-                if let ConstraintType::VectorSimilarity { 
-                    reference_embedding: _, 
-                    threshold, 
-                    .. 
+
+                if let ConstraintType::VectorSimilarity {
+                    reference_embedding: _,
+                    threshold,
+                    ..
                 } = &constraint.constraint_type {
-                    
+
                     // TODO: Compute or cache embedding for payload
                     // For now, placeholder - would use actual embedding model
                     let similarity = 0.0_f32; // Placeholder
-                    
+
                     if similarity >= *threshold {
                         triggered_constraints.push(constraint.id);
-                        
+
                         match constraint.action {
                             ConstraintAction::Block => {
                                 final_verdict = TraceVerdict::Block;
-                                explanation = Some(format!(
-                                    "Vector similarity match: {:.2} >= {:.2}",
-                                    similarity, threshold
-                                ));
+                                block_explanation = Some("Vector similarity match");
+                                block_constraint_id = Some(constraint.id);
                                 break;
                             }
                             ConstraintAction::Modify => {
@@ -202,44 +228,52 @@ impl TrajectoryEngine {
                 }
             }
         }
-        
+
         // Check rate limiting constraints
         for constraint in &self.policy.constraints {
-            if let ConstraintType::RateLimit { max_requests, window_seconds } = &constraint.constraint_type {
+            if let ConstraintType::RateLimit { max_requests, window_seconds: _ } = &constraint.constraint_type {
                 // TODO: Implement rate limit check against shared counter
                 // For now, placeholder - would use Redis or in-memory counter
                 let current_count = 0_u32;
-                
+
                 if current_count >= *max_requests {
                     triggered_constraints.push(constraint.id);
                     final_verdict = TraceVerdict::Block;
-                    explanation = Some(format!(
-                        "Rate limit exceeded: {} requests per {} seconds",
-                        max_requests, window_seconds
-                    ));
+                    block_explanation = Some("Rate limit exceeded");
+                    block_constraint_id = Some(constraint.id);
                     break;
                 }
             }
         }
-        
+
         // Generate modified payload if needed
         let modified_payload = if final_verdict == TraceVerdict::Modify {
             Some(self.apply_modifications(payload))
         } else {
             None
         };
-        
+
         // Use policy default verdict if no constraints triggered
         if triggered_constraints.is_empty() {
             final_verdict = self.policy.default_verdict;
         }
-        
+
+        // Build explanation only when we actually need it — defers the allocation.
+        let explanation = if final_verdict == TraceVerdict::Block {
+            block_constraint_id.map(|id| {
+                let msg = block_explanation.unwrap_or("Blocked by constraint");
+                format!("{}: {}", msg, id)
+            })
+        } else {
+            None
+        };
+
         debug!(
             verdict = ?final_verdict,
             triggered_count = triggered_constraints.len(),
             "Evaluation complete"
         );
-        
+
         EvaluationResult {
             verdict: final_verdict,
             triggered_constraints,
@@ -317,8 +351,8 @@ mod tests {
         }
     }
     
-    #[tokio::test]
-    async fn test_passes_clean_payload() {
+    #[test]
+    fn test_passes_clean_payload() {
         let policy = Arc::new(create_test_policy());
         let engine = TrajectoryEngine::new(policy);
         
@@ -330,13 +364,13 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Pass);
         assert!(result.triggered_constraints.is_empty());
     }
     
-    #[tokio::test]
-    async fn test_blocks_pii() {
+    #[test]
+    fn test_blocks_pii() {
         let policy = Arc::new(create_test_policy());
         let engine = TrajectoryEngine::new(policy);
         
@@ -348,13 +382,13 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Block);
         assert!(!result.triggered_constraints.is_empty());
     }
     
-    #[tokio::test]
-    async fn test_blocks_long_prompt() {
+    #[test]
+    fn test_blocks_long_prompt() {
         let policy = Arc::new(create_test_policy());
         let engine = TrajectoryEngine::new(policy);
         
@@ -367,12 +401,12 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Block);
     }
     
-    #[tokio::test]
-    async fn test_case_insensitive_matching() {
+    #[test]
+    fn test_case_insensitive_matching() {
         let constraint = PolicyConstraint {
             id: uuid::Uuid::new_v4(),
             name: "Block PII Case Insensitive".to_string(),
@@ -404,12 +438,12 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Block);
     }
     
-    #[tokio::test]
-    async fn test_disabled_constraint_ignored() {
+    #[test]
+    fn test_disabled_constraint_ignored() {
         let constraint = PolicyConstraint {
             id: uuid::Uuid::new_v4(),
             name: "Disabled Block".to_string(),
@@ -441,13 +475,13 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Pass);
         assert!(result.triggered_constraints.is_empty());
     }
     
-    #[tokio::test]
-    async fn test_priority_ordering() {
+    #[test]
+    fn test_priority_ordering() {
         let low_priority_constraint = PolicyConstraint {
             id: uuid::Uuid::new_v4(),
             name: "Log First".to_string(),
@@ -492,13 +526,13 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         // Should block because high priority (lower number) constraint is evaluated first
         assert_eq!(result.verdict, TraceVerdict::Block);
     }
     
-    #[tokio::test]
-    async fn test_default_verdict_used() {
+    #[test]
+    fn test_default_verdict_used() {
         let policy = Arc::new(CustomerPolicy {
             customer_id: CustomerId::new(),
             version: "1.0.0".to_string(),
@@ -517,12 +551,12 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Pass);
     }
     
-    #[tokio::test]
-    async fn test_default_verdict_block() {
+    #[test]
+    fn test_default_verdict_block() {
         let policy = Arc::new(CustomerPolicy {
             customer_id: CustomerId::new(),
             version: "1.0.0".to_string(),
@@ -541,12 +575,12 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Block);
     }
     
-    #[tokio::test]
-    async fn test_modify_action_produces_modified_payload() {
+    #[test]
+    fn test_modify_action_produces_modified_payload() {
         let constraint = PolicyConstraint {
             id: uuid::Uuid::new_v4(),
             name: "Modify Content".to_string(),
@@ -578,15 +612,15 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         assert_eq!(result.verdict, TraceVerdict::Modify);
         assert!(result.modified_payload.is_some());
         let modified = result.modified_payload.unwrap();
         assert!(modified.get("_trace_modified").unwrap().as_bool().unwrap());
     }
     
-    #[tokio::test]
-    async fn test_empty_patterns_skipped() {
+    #[test]
+    fn test_empty_patterns_skipped() {
         let constraint = PolicyConstraint {
             id: uuid::Uuid::new_v4(),
             name: "Empty Patterns".to_string(),
@@ -618,7 +652,7 @@ mod tests {
             parameters: None,
         };
         
-        let result = engine.evaluate(&payload).await;
+        let result = engine.evaluate(&payload);
         // Should pass since empty patterns are skipped during compilation
         assert_eq!(result.verdict, TraceVerdict::Pass);
     }

@@ -33,6 +33,96 @@ impl std::fmt::Display for CustomerId {
     }
 }
 
+/// Multi-tenant organization identifier.
+///
+/// In the high-scale shared-process model every tenant data-space is keyed by
+/// an `OrgId`. It is a transparent alias of [`CustomerId`] so existing routing
+/// and storage continue to work unchanged while the public vocabulary moves to
+/// "organization".
+pub type OrgId = CustomerId;
+
+/// Commercial tier for an organization.
+///
+/// Tiers gate operational limits — concurrency, synthetic-probe budget, and how
+/// aggressively the background training shell re-tunes rules.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum BillingTier {
+    /// Entry tier — conservative limits.
+    #[default]
+    Starter,
+    /// Mid-market growth tier.
+    Growth,
+    /// Institutional / regulated tier — highest limits.
+    Enterprise,
+}
+
+impl BillingTier {
+    /// Maximum concurrent in-flight evaluations permitted for this tier.
+    pub fn max_concurrency(&self) -> u32 {
+        match self {
+            BillingTier::Starter => 64,
+            BillingTier::Growth => 256,
+            BillingTier::Enterprise => 1024,
+        }
+    }
+
+    /// Synthetic adversarial probe budget per stress/verification run.
+    pub fn probe_budget(&self) -> usize {
+        match self {
+            BillingTier::Starter => 8,
+            BillingTier::Growth => 16,
+            BillingTier::Enterprise => 32,
+        }
+    }
+}
+
+/// Per-tenant context resolved from request credentials.
+///
+/// Holds the organization id, display name, billing tier, and operational
+/// limits. Resolved once per request and handed to the platform store.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OrganizationContext {
+    /// The tenant key.
+    pub org_id: OrgId,
+    /// Human-readable organization name (never a UUID in the UI).
+    pub display_name: String,
+    /// Commercial tier governing limits.
+    #[serde(default)]
+    pub tier: BillingTier,
+    /// When this organization was onboarded.
+    pub created_at: chrono::DateTime<chrono::Utc>,
+}
+
+impl OrganizationContext {
+    /// Construct a context with sensible defaults for a freshly-seen org.
+    pub fn new(org_id: OrgId, display_name: impl Into<String>, tier: BillingTier) -> Self {
+        Self {
+            org_id,
+            display_name: display_name.into(),
+            tier,
+            created_at: chrono::Utc::now(),
+        }
+    }
+}
+
+/// A natural-language boundary submitted by an administrator through the
+/// training shell, e.g. *"Filter out options trading recommendations outside
+/// the scope of work."*
+///
+/// The training shell compiles directives into concrete [`PolicyConstraint`]s
+/// and hardens the match rules through the simulation loop.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct BoundaryDirective {
+    /// Organization this boundary belongs to.
+    pub org_id: OrgId,
+    /// The raw natural-language instruction from the administrator.
+    pub text: String,
+    /// What the proxy should do when the boundary is tripped.
+    #[serde(default)]
+    pub action: ConstraintAction,
+}
+
 /// Unique identifier for a request (for tracing and observability).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
@@ -193,7 +283,7 @@ pub enum TargetField {
 }
 
 /// The action to take when a constraint matches.
-#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ConstraintAction {
     /// Block the request entirely.
@@ -228,10 +318,11 @@ pub struct CustomerPolicy {
 }
 
 /// The verdict returned by the Trajectory Engine.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum TraceVerdict {
     /// Pass the request through unmodified.
+    #[default]
     Pass,
     
     /// Block the request; do not forward to upstream.
@@ -239,12 +330,6 @@ pub enum TraceVerdict {
     
     /// Modify the request before forwarding.
     Modify,
-}
-
-impl Default for TraceVerdict {
-    fn default() -> Self {
-        TraceVerdict::Pass
-    }
 }
 
 /// The result of evaluating a payload against customer policies.
