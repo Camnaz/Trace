@@ -1,0 +1,66 @@
+[package]
+name = "stria-trace"
+version = "0.1.0"
+edition = "2021"
+authors = ["Stria Systems <engineering@stria.io>"]
+description = "Ultra-low-latency HTTP proxy for LLM request evaluation"
+license = "Proprietary"
+rust-version = "1.75"
+
+[profile.release]
+opt-level = 3
+lto = "fat"
+codegen-units = 1
+panic = "abort"
+strip = true
+
+[dependencies]
+# Async runtime
+tokio = { version = "1.35", features = ["full"] }
+tokio-util = { version = "0.7", features = ["codec", "io"] }
+
+# HTTP framework
+axum = { version = "0.7", features = ["http2", "tokio"] }
+tower = { version = "0.4", features = ["limit", "load-shed"] }
+tower-http = { version = "0.5", features = ["trace", "timeout"] }
+hyper = { version = "1.0", features = ["full"] }
+hyper-util = { version = "0.1", features = ["full"] }
+
+# Serialization
+serde = { version = "1.0", features = ["derive"] }
+serde_json = { version = "1.0", features = ["raw_value"] }
+
+# Concurrent data structures
+dashmap = "5.5"
+arc-swap = "1.7"
+crossbeam = "0.8"
+
+# HTTP client (for upstream forwarding)
+reqwest = { version = "0.11", features = ["json", "stream"] }
+
+# Pattern matching
+regex = "1.10"
+aho-corasick = "1.1"
+
+# Error handling
+thiserror = "1.0"
+anyhow = "1.0"
+
+# Logging & Observability
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+tracing-opentelemetry = "0.22"
+opentelemetry = "0.21"
+
+# Configuration
+config = "0.14"
+
+# Utilities
+bytes = "1.5"
+http = "1.0"
+uuid = { version = "1.6", features = ["v4", "serde"] }
+chrono = { version = "0.4", features = ["serde"] }
+
+[dev-dependencies]
+tokio-test = "0.4"
+reqwest = { version = "0.11", features = ["json"] }
