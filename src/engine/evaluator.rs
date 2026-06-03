@@ -6,14 +6,15 @@
 //! - Vector cache: Embedding similarity
 //! - Wasm sandbox: Complex user-defined logic
 
-use std::collections::HashSet;
 use std::sync::Arc;
 use tracing::{debug, trace, warn};
 
 use crate::types::{
     ConstraintAction, ConstraintType, CustomerPolicy, EvaluationResult,
-    IncomingPayload, PolicyConstraint, TargetField, TraceVerdict,
+    IncomingPayload, PolicyConstraint, TraceVerdict,
 };
+#[cfg(test)]
+use crate::types::{CustomerId, TargetField};
 
 /// The Trajectory Engine evaluates payloads against customer policies.
 pub struct TrajectoryEngine {
@@ -122,7 +123,7 @@ impl TrajectoryEngine {
                     re.is_match(&payload.prompt)
                 }
                 PatternMatcher::Keyword(ac) => {
-                    ac.find(&payload.prompt).is_some()
+                    ac.find(payload.prompt.as_ref()).is_some()
                 }
                 PatternMatcher::Length { max_chars } => {
                     payload.prompt.len() > *max_chars
@@ -169,7 +170,7 @@ impl TrajectoryEngine {
                 }
                 
                 if let ConstraintType::VectorSimilarity { 
-                    reference_embedding, 
+                    reference_embedding: _, 
                     threshold, 
                     .. 
                 } = &constraint.constraint_type {
@@ -276,6 +277,7 @@ impl TrajectoryEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::types::CustomerId;
     
     fn create_test_policy() -> CustomerPolicy {
         CustomerPolicy {
@@ -367,5 +369,257 @@ mod tests {
         
         let result = engine.evaluate(&payload).await;
         assert_eq!(result.verdict, TraceVerdict::Block);
+    }
+    
+    #[tokio::test]
+    async fn test_case_insensitive_matching() {
+        let constraint = PolicyConstraint {
+            id: uuid::Uuid::new_v4(),
+            name: "Block PII Case Insensitive".to_string(),
+            constraint_type: ConstraintType::Keyword {
+                patterns: vec!["ssn".to_string()],
+                case_sensitive: false,
+                target_field: TargetField::Prompt,
+            },
+            action: ConstraintAction::Block,
+            priority: 1,
+            enabled: true,
+        };
+        
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![constraint],
+            default_verdict: TraceVerdict::Pass,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("My SSN is confidential"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        assert_eq!(result.verdict, TraceVerdict::Block);
+    }
+    
+    #[tokio::test]
+    async fn test_disabled_constraint_ignored() {
+        let constraint = PolicyConstraint {
+            id: uuid::Uuid::new_v4(),
+            name: "Disabled Block".to_string(),
+            constraint_type: ConstraintType::Keyword {
+                patterns: vec!["blocked".to_string()],
+                case_sensitive: false,
+                target_field: TargetField::Prompt,
+            },
+            action: ConstraintAction::Block,
+            priority: 1,
+            enabled: false, // Disabled
+        };
+        
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![constraint],
+            default_verdict: TraceVerdict::Pass,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("This contains blocked text"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        assert_eq!(result.verdict, TraceVerdict::Pass);
+        assert!(result.triggered_constraints.is_empty());
+    }
+    
+    #[tokio::test]
+    async fn test_priority_ordering() {
+        let low_priority_constraint = PolicyConstraint {
+            id: uuid::Uuid::new_v4(),
+            name: "Log First".to_string(),
+            constraint_type: ConstraintType::Keyword {
+                patterns: vec!["test".to_string()],
+                case_sensitive: false,
+                target_field: TargetField::Prompt,
+            },
+            action: ConstraintAction::Log,
+            priority: 10,
+            enabled: true,
+        };
+        
+        let high_priority_constraint = PolicyConstraint {
+            id: uuid::Uuid::new_v4(),
+            name: "Block First".to_string(),
+            constraint_type: ConstraintType::Keyword {
+                patterns: vec!["test".to_string()],
+                case_sensitive: false,
+                target_field: TargetField::Prompt,
+            },
+            action: ConstraintAction::Block,
+            priority: 1,
+            enabled: true,
+        };
+        
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![low_priority_constraint.clone(), high_priority_constraint.clone()],
+            default_verdict: TraceVerdict::Pass,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("test content"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        // Should block because high priority (lower number) constraint is evaluated first
+        assert_eq!(result.verdict, TraceVerdict::Block);
+    }
+    
+    #[tokio::test]
+    async fn test_default_verdict_used() {
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![], // No constraints
+            default_verdict: TraceVerdict::Pass,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("Any content"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        assert_eq!(result.verdict, TraceVerdict::Pass);
+    }
+    
+    #[tokio::test]
+    async fn test_default_verdict_block() {
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![],
+            default_verdict: TraceVerdict::Block,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("Any content"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        assert_eq!(result.verdict, TraceVerdict::Block);
+    }
+    
+    #[tokio::test]
+    async fn test_modify_action_produces_modified_payload() {
+        let constraint = PolicyConstraint {
+            id: uuid::Uuid::new_v4(),
+            name: "Modify Content".to_string(),
+            constraint_type: ConstraintType::Keyword {
+                patterns: vec!["modify-me".to_string()],
+                case_sensitive: false,
+                target_field: TargetField::Prompt,
+            },
+            action: ConstraintAction::Modify,
+            priority: 1,
+            enabled: true,
+        };
+        
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![constraint],
+            default_verdict: TraceVerdict::Pass,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("Please modify-me here"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        assert_eq!(result.verdict, TraceVerdict::Modify);
+        assert!(result.modified_payload.is_some());
+        let modified = result.modified_payload.unwrap();
+        assert!(modified.get("_trace_modified").unwrap().as_bool().unwrap());
+    }
+    
+    #[tokio::test]
+    async fn test_empty_patterns_skipped() {
+        let constraint = PolicyConstraint {
+            id: uuid::Uuid::new_v4(),
+            name: "Empty Patterns".to_string(),
+            constraint_type: ConstraintType::Keyword {
+                patterns: vec![], // Empty patterns
+                case_sensitive: false,
+                target_field: TargetField::Prompt,
+            },
+            action: ConstraintAction::Block,
+            priority: 1,
+            enabled: true,
+        };
+        
+        let policy = Arc::new(CustomerPolicy {
+            customer_id: CustomerId::new(),
+            version: "1.0.0".to_string(),
+            constraints: vec![constraint],
+            default_verdict: TraceVerdict::Pass,
+            updated_at: chrono::Utc::now(),
+        });
+        
+        let engine = TrajectoryEngine::new(policy);
+        
+        let payload = IncomingPayload {
+            prompt: std::borrow::Cow::Borrowed("Any content"),
+            system: None,
+            context: std::collections::HashMap::new(),
+            target_model: std::borrow::Cow::Borrowed("gpt-4"),
+            parameters: None,
+        };
+        
+        let result = engine.evaluate(&payload).await;
+        // Should pass since empty patterns are skipped during compilation
+        assert_eq!(result.verdict, TraceVerdict::Pass);
     }
 }

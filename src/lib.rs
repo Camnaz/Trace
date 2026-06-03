@@ -12,14 +12,19 @@ use std::sync::Arc;
 
 use axum::{routing::post, Router};
 use tokio::signal;
+use tokio::sync::broadcast;
 use tower::ServiceBuilder;
 use tower_http::timeout::TimeoutLayer;
 use tower_http::trace::TraceLayer;
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
-use types::ProxyConfig;
+use types::{ProxyConfig, TelemetryEvent};
 use policy::PolicyStore;
+
+/// Capacity of the telemetry broadcast channel.
+/// Lagging subscribers simply lose old events — the proxy never blocks.
+const TELEMETRY_CHANNEL_CAPACITY: usize = 512;
 
 /// Application state shared across all request handlers.
 #[derive(Clone)]
@@ -30,6 +35,8 @@ pub struct AppState {
     pub policy_store: PolicyStore,
     /// HTTP client for forwarding to upstream LLM.
     pub http_client: reqwest::Client,
+    /// Broadcast sender for real-time telemetry events (SSE, dashboards, CI).
+    pub telemetry_tx: broadcast::Sender<TelemetryEvent>,
 }
 
 /// Initialize and run the Trace proxy server.
@@ -61,11 +68,15 @@ pub async fn run() {
         .build()
         .expect("Failed to build HTTP client");
 
+    // Create the telemetry broadcast channel
+    let (telemetry_tx, _) = broadcast::channel(TELEMETRY_CHANNEL_CAPACITY);
+
     // Create shared application state
     let state = AppState {
         config: Arc::new(config),
         policy_store,
         http_client,
+        telemetry_tx,
     };
 
     // Build the Axum router
@@ -104,13 +115,20 @@ fn build_router(state: AppState) -> Router {
     Router::new()
         // Main proxy endpoint
         .route("/v1/proxy", post(proxy::handle_proxy_request))
+        // Real-time telemetry stream (Server-Sent Events)
+        .route("/v1/events", axum::routing::get(telemetry::sse_handler))
         // Health check
         .route("/health", axum::routing::get(health_check))
         // Admin endpoints for policy management
+        .route("/admin/v1/policies",
+            axum::routing::get(admin::list_policies))
         .route("/admin/v1/policies/:customer_id", 
             axum::routing::post(admin::update_policy)
             .get(admin::get_policy)
             .delete(admin::delete_policy))
+        // Policy Studio web UI
+        .route("/", axum::routing::get(ui::serve_ui))
+        .route("/ui", axum::routing::get(ui::serve_ui))
         .layer(middleware_stack)
         .with_state(state)
 }
@@ -210,7 +228,7 @@ mod admin {
         
         match state.policy_store.get_policy(customer_id).await {
             Some(policy) => {
-                let json = serde_json::to_string(&policy)
+                let json = serde_json::to_string(policy.as_ref())
                     .unwrap_or_else(|_| "{}".to_string());
                 (
                     axum::http::StatusCode::OK,
@@ -238,5 +256,75 @@ mod admin {
         state.policy_store.remove_policy(customer_id);
         
         (axum::http::StatusCode::NO_CONTENT, "")
+    }
+
+    /// List all customer policies currently loaded in the store.
+    pub async fn list_policies(
+        State(state): State<AppState>,
+    ) -> impl axum::response::IntoResponse {
+        let ids = state.policy_store.customer_ids();
+        let mut policies = Vec::with_capacity(ids.len());
+
+        for cid in ids {
+            if let Some(p) = state.policy_store.get_policy(cid).await {
+                policies.push(p.as_ref().clone());
+            }
+        }
+
+        match serde_json::to_string(&policies) {
+            Ok(json) => (
+                axum::http::StatusCode::OK,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                json,
+            ),
+            Err(_) => (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                [(axum::http::header::CONTENT_TYPE, "application/json")],
+                r#"{"error":"serialization failed"}"#.to_string(),
+            ),
+        }
+    }
+}
+
+/// Server-Sent Events handler for real-time telemetry.
+mod telemetry {
+    use super::*;
+    use axum::extract::State;
+    use axum::response::sse::{Event, KeepAlive, Sse};
+    use futures_util::stream::Stream;
+    use std::convert::Infallible;
+    use tokio_stream::wrappers::BroadcastStream;
+    use tokio_stream::StreamExt as _;
+
+    /// Subscribe to the telemetry broadcast and stream events as SSE.
+    pub async fn sse_handler(
+        State(state): State<AppState>,
+    ) -> Sse<impl Stream<Item = Result<Event, Infallible>>> {
+        let rx = state.telemetry_tx.subscribe();
+        let stream = BroadcastStream::new(rx)
+            .filter_map(|result| {
+                match result {
+                    Ok(event) => {
+                        let data = serde_json::to_string(&event)
+                            .unwrap_or_else(|_| "{}".to_string());
+                        Some(Ok(Event::default().event("trace").data(data)))
+                    }
+                    // Lagged — subscriber fell behind; skip and continue
+                    Err(_) => None,
+                }
+            });
+
+        Sse::new(stream).keep_alive(KeepAlive::default())
+    }
+}
+
+/// Policy Studio web UI — served as a single embedded HTML file.
+mod ui {
+    use axum::response::Html;
+
+    const UI_HTML: &str = include_str!("../ui/index.html");
+
+    pub async fn serve_ui() -> Html<&'static str> {
+        Html(UI_HTML)
     }
 }

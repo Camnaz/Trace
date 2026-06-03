@@ -6,7 +6,7 @@
 use std::sync::Arc;
 use dashmap::DashMap;
 use arc_swap::ArcSwap;
-use tracing::{debug, info, warn};
+use tracing::{debug, info};
 
 use crate::types::{CustomerId, CustomerPolicy};
 
@@ -159,5 +159,91 @@ mod tests {
         store.remove_policy(customer_id);
         assert!(!store.contains(customer_id));
         assert!(store.get_policy(customer_id).await.is_none());
+    }
+    
+    #[test]
+    fn test_store_len_and_is_empty() {
+        let store = PolicyStore::new();
+        assert!(store.is_empty());
+        assert_eq!(store.len(), 0);
+        
+        let customer_id = CustomerId::new();
+        let policy = create_test_policy();
+        store.set_policy(customer_id, policy);
+        
+        assert!(!store.is_empty());
+        assert_eq!(store.len(), 1);
+    }
+    
+    #[tokio::test]
+    async fn test_get_nonexistent_policy() {
+        let store = PolicyStore::new();
+        let customer_id = CustomerId::new();
+        
+        let result = store.get_policy(customer_id).await;
+        assert!(result.is_none());
+    }
+    
+    #[test]
+    fn test_store_clone() {
+        let store1 = PolicyStore::new();
+        let customer_id = CustomerId::new();
+        let policy = create_test_policy();
+        
+        store1.set_policy(customer_id, policy);
+        
+        let store2 = store1.clone();
+        
+        // Both stores should have the same policy
+        assert_eq!(store1.len(), 1);
+        assert_eq!(store2.len(), 1);
+        assert!(store1.contains(customer_id));
+        assert!(store2.contains(customer_id));
+    }
+    
+    #[test]
+    fn test_customer_ids() {
+        let store = PolicyStore::new();
+        let id1 = CustomerId::new();
+        let id2 = CustomerId::new();
+        
+        store.set_policy(id1, create_test_policy());
+        store.set_policy(id2, create_test_policy());
+        
+        let ids = store.customer_ids();
+        assert_eq!(ids.len(), 2);
+        assert!(ids.contains(&id1));
+        assert!(ids.contains(&id2));
+    }
+    
+    #[tokio::test]
+    async fn test_concurrent_reads() {
+        let store = PolicyStore::new();
+        let customer_id = CustomerId::new();
+        let policy = create_test_policy();
+        
+        store.set_policy(customer_id, policy);
+        
+        // Spawn multiple concurrent reads
+        let mut handles = vec![];
+        for _ in 0..10 {
+            let store_ref = store.clone();
+            let cid = customer_id;
+            handles.push(tokio::spawn(async move {
+                store_ref.get_policy(cid).await
+            }));
+        }
+        
+        // All reads should succeed
+        for handle in handles {
+            let result = handle.await.unwrap();
+            assert!(result.is_some());
+        }
+    }
+    
+    #[test]
+    fn test_default_store() {
+        let store: PolicyStore = Default::default();
+        assert!(store.is_empty());
     }
 }

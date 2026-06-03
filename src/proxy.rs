@@ -9,17 +9,17 @@
 
 use axum::body::Body;
 use axum::extract::State;
-use axum::http::{header, HeaderMap, Request, StatusCode};
-use axum::response::{IntoResponse, Response};
+use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::Response;
 use bytes::Bytes;
 use std::time::Instant;
 use tracing::{error, info, instrument, warn};
 
 use crate::engine::TrajectoryEngine;
-use crate::main::AppState;
+use crate::AppState;
 use crate::types::{
-    BlockResponse, CustomerId, EvaluationResult, IncomingPayload, RequestContext, 
-    RequestId, TraceError, TraceVerdict
+    BlockResponse, CustomerId, EvaluationResult, IncomingPayload, RequestContext,
+    TelemetryEvent, TraceError, TraceVerdict,
 };
 
 /// Header name for customer identification.
@@ -128,7 +128,21 @@ pub async fn handle_proxy_request(
         evaluation_latency_us = evaluation_result.latency_us,
         "Request complete"
     );
-    
+
+    // Emit telemetry asynchronously — lagging subscribers are dropped, never block.
+    let event = TelemetryEvent {
+        request_id: request_ctx.request_id,
+        customer_id,
+        verdict: evaluation_result.verdict,
+        triggered_constraints: evaluation_result.triggered_constraints.clone(),
+        explanation: evaluation_result.explanation.clone(),
+        total_latency_us: total_latency,
+        eval_latency_us: evaluation_result.latency_us,
+        timestamp: chrono::Utc::now(),
+    };
+    // send() only errors when there are zero subscribers — that's fine.
+    let _ = state.telemetry_tx.send(event);
+
     response
 }
 
@@ -159,20 +173,16 @@ async fn read_body(
     body: Body,
     max_size: usize,
 ) -> Result<Bytes, Box<dyn std::error::Error>> {
-    use axum::body::HttpBody;
+    use http_body_util::BodyExt;
     
-    let mut body = body;
-    let mut buffer = bytes::BytesMut::new();
+    let collected = body.collect().await?;
+    let bytes = collected.to_bytes();
     
-    while let Some(chunk) = body.data().await {
-        let chunk = chunk?;
-        if buffer.len() + chunk.len() > max_size {
-            return Err("Body exceeds maximum size".into());
-        }
-        buffer.extend_from_slice(&chunk);
+    if bytes.len() > max_size {
+        return Err("Body exceeds maximum size".into());
     }
     
-    Ok(buffer.freeze())
+    Ok(bytes)
 }
 
 /// Evaluate the payload against customer policies.
@@ -226,10 +236,14 @@ async fn forward_to_upstream(
     
     // Forward relevant headers
     for (name, value) in headers.iter() {
-        let name = name.as_str();
+        let name_str = name.as_str();
         // Skip hop-by-hop headers
-        if !is_hop_by_hop_header(name) {
-            upstream_request = upstream_request.header(name, value);
+        if !is_hop_by_hop_header(name_str) {
+            if let Ok(name) = reqwest::header::HeaderName::from_bytes(name_str.as_bytes()) {
+                if let Ok(value) = reqwest::header::HeaderValue::from_bytes(value.as_bytes()) {
+                    upstream_request = upstream_request.header(name, value);
+                }
+            }
         }
     }
     
@@ -243,8 +257,16 @@ async fn forward_to_upstream(
             match upstream_response.bytes().await {
                 Ok(body) => {
                     let mut response = Response::new(Body::from(body));
-                    *response.status_mut() = status;
-                    *response.headers_mut() = headers;
+                    *response.status_mut() = StatusCode::from_u16(status.as_u16())
+                        .unwrap_or(StatusCode::OK);
+                    // Convert headers
+                    for (name, value) in headers.iter() {
+                        if let Ok(name) = header::HeaderName::from_bytes(name.as_str().as_bytes()) {
+                            if let Ok(val) = header::HeaderValue::from_bytes(value.as_bytes()) {
+                                response.headers_mut().insert(name, val);
+                            }
+                        }
+                    }
                     response
                 }
                 Err(e) => {
@@ -325,4 +347,178 @@ fn error_response(status: StatusCode, message: &str) -> Response {
     );
     
     response
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use axum::body::Body;
+    use axum::http::{HeaderMap, HeaderValue};
+    use bytes::Bytes;
+
+    #[test]
+    fn test_extract_customer_id_valid() {
+        let mut headers = HeaderMap::new();
+        let valid_uuid = uuid::Uuid::new_v4();
+        headers.insert(
+            HEADER_CUSTOMER_ID,
+            HeaderValue::from_str(&valid_uuid.to_string()).unwrap()
+        );
+
+        let result = extract_customer_id(&headers);
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap().0, valid_uuid);
+    }
+
+    #[test]
+    fn test_extract_customer_id_missing() {
+        let headers = HeaderMap::new();
+        let result = extract_customer_id(&headers);
+        
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TraceError::InvalidRequest(msg) => {
+                assert!(msg.contains("Missing required header"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_extract_customer_id_invalid_uuid() {
+        let mut headers = HeaderMap::new();
+        headers.insert(HEADER_CUSTOMER_ID, HeaderValue::from_static("not-a-uuid"));
+        
+        let result = extract_customer_id(&headers);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TraceError::InvalidRequest(msg) => {
+                assert!(msg.contains("Invalid UUID"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    #[test]
+    fn test_extract_customer_id_invalid_format() {
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            HEADER_CUSTOMER_ID,
+            HeaderValue::from_bytes(&[0x80, 0x81, 0x82]).unwrap()
+        );
+        
+        let result = extract_customer_id(&headers);
+        assert!(result.is_err());
+        match result.unwrap_err() {
+            TraceError::InvalidRequest(msg) => {
+                assert!(msg.contains("Invalid customer ID format"));
+            }
+            _ => panic!("Expected InvalidRequest error"),
+        }
+    }
+
+    #[tokio::test]
+    async fn test_read_body_success() {
+        let body = Body::from("test body content");
+        let result = read_body(body, 1024).await;
+        
+        assert!(result.is_ok());
+        assert_eq!(result.unwrap(), Bytes::from("test body content"));
+    }
+
+    #[tokio::test]
+    async fn test_read_body_empty() {
+        let body = Body::empty();
+        let result = read_body(body, 1024).await;
+        
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_read_body_exceeds_max_size() {
+        let large_content = "x".repeat(200);
+        let body = Body::from(large_content);
+        let result = read_body(body, 100).await;
+        
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_is_hop_by_hop_header() {
+        assert!(is_hop_by_hop_header("connection"));
+        assert!(is_hop_by_hop_header("keep-alive"));
+        assert!(is_hop_by_hop_header("proxy-authenticate"));
+        assert!(is_hop_by_hop_header("proxy-authorization"));
+        assert!(is_hop_by_hop_header("te"));
+        assert!(is_hop_by_hop_header("trailers"));
+        assert!(is_hop_by_hop_header("transfer-encoding"));
+        assert!(is_hop_by_hop_header("upgrade"));
+        
+        assert!(is_hop_by_hop_header("Connection"));
+        assert!(is_hop_by_hop_header("KEEP-ALIVE"));
+    }
+
+    #[test]
+    fn test_is_not_hop_by_hop_header() {
+        assert!(!is_hop_by_hop_header("content-type"));
+        assert!(!is_hop_by_hop_header("authorization"));
+        assert!(!is_hop_by_hop_header("x-custom-header"));
+    }
+
+    #[test]
+    fn test_block_response_generation() {
+        let customer_id = CustomerId::new();
+        let ctx = RequestContext::new(customer_id);
+        let result = EvaluationResult {
+            verdict: TraceVerdict::Block,
+            triggered_constraints: vec![uuid::Uuid::new_v4()],
+            explanation: Some("Test block reason".to_string()),
+            modified_payload: None,
+            latency_us: 100,
+        };
+
+        let response = block_response(&ctx, &result);
+        
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_block_response_no_explanation() {
+        let customer_id = CustomerId::new();
+        let ctx = RequestContext::new(customer_id);
+        let result = EvaluationResult {
+            verdict: TraceVerdict::Block,
+            triggered_constraints: vec![],
+            explanation: None,
+            modified_payload: None,
+            latency_us: 100,
+        };
+
+        let response = block_response(&ctx, &result);
+        
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+    }
+
+    #[test]
+    fn test_error_response_generation() {
+        let response = error_response(StatusCode::BAD_REQUEST, "Invalid input");
+        
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/json"
+        );
+    }
+
+    #[test]
+    fn test_error_response_escapes_quotes() {
+        let response = error_response(StatusCode::BAD_REQUEST, r#"Error: "bad" input"#);
+        
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
 }

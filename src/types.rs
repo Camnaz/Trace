@@ -27,6 +27,12 @@ impl Default for CustomerId {
     }
 }
 
+impl std::fmt::Display for CustomerId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
 /// Unique identifier for a request (for tracing and observability).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 pub struct RequestId(pub Uuid);
@@ -344,6 +350,31 @@ impl RequestContext {
 
 /// A pre-allocated buffer for streaming request bodies.
 pub type BodyBuffer = bytes::BytesMut;
+
+/// A telemetry event emitted after every evaluated request.
+///
+/// Broadcast over a tokio channel so the SSE endpoint and any future
+/// consumers can subscribe without blocking the proxy hot-path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TelemetryEvent {
+    /// The request that was evaluated.
+    pub request_id: RequestId,
+    /// The customer the request belonged to.
+    pub customer_id: CustomerId,
+    /// Final verdict.
+    pub verdict: TraceVerdict,
+    /// Constraints that fired (may be empty).
+    pub triggered_constraints: Vec<uuid::Uuid>,
+    /// Human-readable explanation when a constraint fired.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub explanation: Option<String>,
+    /// Total proxy latency in microseconds (parse + eval + verdict).
+    pub total_latency_us: u64,
+    /// Engine-only evaluation latency in microseconds.
+    pub eval_latency_us: u64,
+    /// UTC timestamp of the event.
+    pub timestamp: chrono::DateTime<chrono::Utc>,
+}
 
 /// Error types that can occur during request processing.
 #[derive(Debug, thiserror::Error)]

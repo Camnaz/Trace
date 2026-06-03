@@ -8,7 +8,7 @@
 use std::path::PathBuf;
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use colored::Colorize;
 use reqwest::Client;
@@ -176,15 +176,6 @@ struct ProxyRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     parameters: Option<serde_json::Value>,
-}
-
-/// The evaluation result returned by the proxy when blocked.
-#[derive(Debug, Deserialize, Default)]
-struct ProxyBlockResponse {
-    #[serde(default)]
-    blocked: bool,
-    #[serde(default)]
-    reason: String,
 }
 
 // ════════════════════════════════════════════════════════════
@@ -599,9 +590,13 @@ fn load_suite(path: &PathBuf) -> Result<TestSuite> {
             .with_context(|| "Failed to parse JSON suite file")?,
         _ => {
             // Try YAML first, then JSON
-            serde_yaml::from_str(&content)
-                .or_else(|_| serde_json::from_str::<TestSuite>(&content).map_err(Into::into))
-                .with_context(|| "Failed to parse suite file (tried YAML and JSON)")?
+            if let Ok(suite) = serde_yaml::from_str::<TestSuite>(&content) {
+                suite
+            } else if let Ok(suite) = serde_json::from_str::<TestSuite>(&content) {
+                suite
+            } else {
+                anyhow::bail!("Failed to parse suite file (tried YAML and JSON)");
+            }
         }
     };
 
