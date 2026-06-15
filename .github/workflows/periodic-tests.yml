@@ -58,7 +58,7 @@ jobs:
 
       - name: Upload test results
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: test-results-${{ matrix.os }}-${{ matrix.rust-version }}
           path: test-output.txt
@@ -96,7 +96,7 @@ jobs:
           /usr/bin/time -v cargo test --release --test integration_tests 2>&1 | tee timing-results.txt
 
       - name: Upload timing results
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: timing-results
           path: timing-results.txt
@@ -130,7 +130,7 @@ jobs:
 
       - name: Upload stability report
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: stability-report
           path: stability-reports/
